@@ -823,103 +823,92 @@ async function exportAssembled() {
   }
 }
 
-// ─── Export Trame MP4 via WebCodecs ──────────────────────────────────────────
+// ─── Export Trame MP4 via FFmpeg.wasm ────────────────────────────────────────
+let ffmpegLoaded = false;
+let ffmpegInstance = null;
+
+async function getFFmpeg() {
+  if (ffmpegLoaded) return ffmpegInstance;
+  const { FFmpeg } = FFmpegWASM;
+  const ff = new FFmpeg();
+  ff.on('progress', ({ progress }) => {
+    document.getElementById('renderBar').style.width = (progress * 100) + '%';
+  });
+  ff.on('log', ({ message }) => {
+    document.getElementById('renderSub').textContent = message.substring(0, 80);
+  });
+  await ff.load({
+    coreURL: '/ffmpeg/ffmpeg-core.js',
+    wasmURL: '/ffmpeg/ffmpeg-core.wasm',
+  });
+  ffmpegLoaded = true;
+  ffmpegInstance = ff;
+  return ff;
+}
+
 async function exportTemplateMP4() {
   if (cuts.length === 0) { showToast('Analyse une vidéo d\'abord'); return; }
-  if (typeof VideoEncoder === 'undefined') { showToast('WebCodecs non supporté - utilise Chrome'); return; }
-  if (typeof FFmpegWASM === 'undefined') { showToast('FFmpeg non chargé - vérifie ta connexion'); return; }
+  if (typeof FFmpegWASM === 'undefined') { showToast('FFmpeg non chargé'); return; }
 
   const overlay = document.getElementById('renderOverlay');
   overlay.classList.add('show');
   document.getElementById('renderTitle').textContent = 'Trame MP4';
-  document.getElementById('renderSub').textContent = 'Préparation...';
+  document.getElementById('renderSub').textContent = 'Chargement FFmpeg (~30MB)...';
   document.getElementById('renderBar').style.width = '0%';
 
   const W = 1080, H = 1920, FPS = 30;
   const colors = ['#FF4D6D','#00F0A0','#FFD166','#4DABF7','#FF9F43','#A29BFE','#FD79A8','#55EFC4','#FDCB6E','#74B9FF'];
-  const totalDuration = cuts.reduce((s, c) => s + c.duration, 0);
-  const totalFrames = Math.round(totalDuration * FPS);
 
   try {
+    const ff = await getFFmpeg();
 
-    const target = new ArrayBufferTarget();
-    const muxer = new Muxer({ target, video: { codec: 'avc', width: W, height: H }, fastStart: 'in-memory' });
-
-    // Find a supported codec
-    const codecCandidates = [
-      'avc1.42001e', // H264 Baseline 3.0
-      'avc1.42001f', // H264 Baseline 3.1
-      'avc1.4d001f', // H264 Main 3.1
-      'avc1.64001f', // H264 High 3.1
-    ];
-    let supportedCodec = null;
-    for (const codec of codecCandidates) {
-      try {
-        const support = await VideoEncoder.isConfigSupported({ codec, width: W, height: H, bitrate: 4_000_000, framerate: FPS });
-        if (support.supported) { supportedCodec = codec; break; }
-      } catch(e) {}
-    }
-    if (!supportedCodec) throw new Error('Aucun codec H264 supporté sur cet appareil');
-
-    const videoEncoder = new VideoEncoder({
-      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
-      error: e => console.error('VideoEncoder:', e)
-    });
-    videoEncoder.configure({ codec: supportedCodec, width: W, height: H, bitrate: 4_000_000, framerate: FPS });
-
-    // Pre-render slot images as ImageData (sync)
     const tmpCanvas = document.createElement('canvas');
     tmpCanvas.width = W; tmpCanvas.height = H;
     const ctx = tmpCanvas.getContext('2d');
-    const slotImageDatas = [];
+
+    let concatList = '';
 
     for (let i = 0; i < cuts.length; i++) {
+      document.getElementById('renderSub').textContent = `Plan ${i+1}/${cuts.length} - génération image...`;
+      document.getElementById('renderBar').style.width = (i / cuts.length * 50) + '%';
+
       const color = colors[i % colors.length];
       ctx.fillStyle = color; ctx.fillRect(0, 0, W, H);
       ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(0, H/2-140, W, 280);
       ctx.fillStyle = '#fff'; ctx.textAlign = 'center';
       ctx.font = 'bold 200px Arial';
-      ctx.fillText(`#${String(i+1).padStart(2,'0')}`, W/2, H/2+70);
+      ctx.fillText('#' + String(i+1).padStart(2,'0'), W/2, H/2+70);
       ctx.font = '70px Arial'; ctx.fillStyle = 'rgba(255,255,255,0.8)';
       ctx.fillText(fmtTime(cuts[i].duration), W/2, H/2+170);
-      slotImageDatas.push(ctx.getImageData(0, 0, W, H));
+
+      const blob = await new Promise(r => tmpCanvas.toBlob(r, 'image/png'));
+      const arr = new Uint8Array(await blob.arrayBuffer());
+      await ff.writeFile('slot' + i + '.png', arr);
+
+      document.getElementById('renderSub').textContent = `Plan ${i+1}/${cuts.length} - encodage...`;
+      await ff.exec([
+        '-loop', '1', '-i', 'slot' + i + '.png',
+        '-t', cuts[i].duration.toFixed(3),
+        '-vf', 'fps=' + FPS,
+        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+        '-y', 'seg' + i + '.mp4'
+      ]);
+
+      concatList += "file 'seg" + i + ".mp4'\n";
+      document.getElementById('renderBar').style.width = ((i+1) / cuts.length * 80) + '%';
     }
 
-    document.getElementById('renderSub').textContent = 'Encodage...';
-    let frameCount = 0;
+    await ff.writeFile('concat.txt', concatList);
+    document.getElementById('renderSub').textContent = 'Assemblage final...';
+    await ff.exec(['-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', '-y', 'trame.mp4']);
+    document.getElementById('renderBar').style.width = '100%';
 
-    for (let i = 0; i < cuts.length; i++) {
-      const slotFrames = Math.round(cuts[i].duration * FPS);
-      const imageData = slotImageDatas[i];
-
-      for (let f = 0; f < slotFrames; f++) {
-        if (videoEncoder.state !== 'configured') throw new Error(`Encodeur fermé (état: ${videoEncoder.state})`);
-
-        const vf = new VideoFrame(imageData.data, {
-          format: 'RGBA', codedWidth: W, codedHeight: H,
-          timestamp: Math.round(frameCount * (1_000_000 / FPS)),
-          duration: Math.round(1_000_000 / FPS)
-        });
-        videoEncoder.encode(vf, { keyFrame: f === 0 });
-        vf.close();
-        frameCount++;
-
-        if (frameCount % 30 === 0) {
-          document.getElementById('renderBar').style.width = (frameCount/totalFrames*100) + '%';
-          document.getElementById('renderSub').textContent = `Plan ${i+1}/${cuts.length} — ${Math.round(frameCount/totalFrames*100)}%`;
-          await new Promise(r => setTimeout(r, 0));
-        }
-      }
-    }
-
-    document.getElementById('renderSub').textContent = 'Finalisation...';
-    await videoEncoder.flush();
-    muxer.finalize();
-
-    const blob = new Blob([target.buffer], { type: 'video/mp4' });
-    const url = URL.createObjectURL(blob);
+    const data = await ff.readFile('trame.mp4');
+    const mp4Blob = new Blob([data.buffer], { type: 'video/mp4' });
+    const url = URL.createObjectURL(mp4Blob);
     const a = document.createElement('a');
     a.href = url; a.download = 'cutsync_trame.mp4'; a.click();
+
     overlay.classList.remove('show');
     showToast('Trame MP4 exportée !');
 
@@ -930,7 +919,7 @@ async function exportTemplateMP4() {
   }
 }
 
-// ─── Export CSV ───────────────────────────────────────────────────────────────
+
 function exportCsv() {
   if (!cuts.length) { showToast('Analyse une vidéo d\'abord'); return; }
   const rows = ['index,start_s,end_s,duration_s', ...cuts.map((c,i) => `${i+1},${c.start.toFixed(3)},${c.end.toFixed(3)},${c.duration.toFixed(3)}`)];
