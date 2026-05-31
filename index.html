@@ -4,8 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>CutSync</title>
-<script src="/ffmpeg/ffmpeg.js"></script>
-<script src="/ffmpeg/ffmpeg-util.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.3/build/mp4-muxer.min.js"></script>
 <style>
 @font-face {
   font-family: 'Syne';
@@ -942,4 +941,114 @@ function showToast(msg) {
 }
 </script>
 </body>
-</html>
+</html>// ─── Export Trame MP4 via WebCodecs + mp4-muxer ──────────────────────────────
+async function exportTemplateMP4() {
+  if (cuts.length === 0) { showToast('Analyse une vidéo d\'abord'); return; }
+  if (typeof VideoEncoder === 'undefined') { showToast('WebCodecs non supporté - utilise Chrome'); return; }
+  if (typeof Mp4Muxer === 'undefined') { showToast('mp4-muxer non chargé'); return; }
+
+  const overlay = document.getElementById('renderOverlay');
+  overlay.classList.add('show');
+  document.getElementById('renderTitle').textContent = 'Trame MP4';
+  document.getElementById('renderSub').textContent = 'Initialisation...';
+  document.getElementById('renderBar').style.width = '0%';
+
+  // Use 1280x720 - max compatibility on Android and desktop
+  const W = 1280, H = 720, FPS = 30;
+  const colors = ['#FF4D6D','#00F0A0','#FFD166','#4DABF7','#FF9F43','#A29BFE','#FD79A8','#55EFC4','#FDCB6E','#74B9FF'];
+  const totalDuration = cuts.reduce((s, c) => s + c.duration, 0);
+  const totalFrames = Math.round(totalDuration * FPS);
+
+  try {
+    const { Muxer, ArrayBufferTarget } = Mp4Muxer;
+    const target = new ArrayBufferTarget();
+    const muxer = new Muxer({
+      target,
+      video: { codec: 'avc', width: W, height: H },
+      fastStart: 'in-memory'
+    });
+
+    const config = {
+      codec: 'avc1.42401E', // H.264 Baseline - most compatible
+      width: W, height: H,
+      bitrate: 2_000_000,
+      framerate: FPS,
+      avc: { format: 'annexb' }
+    };
+
+    const support = await VideoEncoder.isConfigSupported(config);
+    if (!support.supported) throw new Error('H264 non supporté sur cet appareil');
+
+    let encoderError = null;
+    const videoEncoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: (e) => { encoderError = e; console.error('VideoEncoder:', e); }
+    });
+    videoEncoder.configure(config);
+
+    // Use OffscreenCanvas for better GPU memory management
+    const offCanvas = new OffscreenCanvas(W, H);
+    const ctx = offCanvas.getContext('2d');
+
+    let frameCount = 0;
+
+    for (let i = 0; i < cuts.length; i++) {
+      if (encoderError) throw encoderError;
+      const slotFrames = Math.round(cuts[i].duration * FPS);
+      const color = colors[i % colors.length];
+
+      // Draw slot image once
+      ctx.fillStyle = color;
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(0, H/2-80, W, 160);
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 120px Arial';
+      ctx.fillText('#' + String(i+1).padStart(2,'0'), W/2, H/2+40);
+      ctx.font = '40px Arial';
+      ctx.fillStyle = 'rgba(255,255,255,0.8)';
+      ctx.fillText(fmtTime(cuts[i].duration), W/2, H/2+90);
+
+      for (let f = 0; f < slotFrames; f++) {
+        if (encoderError) throw encoderError;
+
+        const frame = new VideoFrame(offCanvas, {
+          timestamp: Math.round(frameCount * (1_000_000 / FPS)),
+          duration: Math.round(1_000_000 / FPS)
+        });
+
+        videoEncoder.encode(frame, { keyFrame: f === 0 });
+        frame.close(); // CRITICAL: release GPU memory immediately
+
+        frameCount++;
+
+        if (frameCount % 15 === 0) {
+          document.getElementById('renderBar').style.width = (frameCount/totalFrames*100) + '%';
+          document.getElementById('renderSub').textContent =
+            `Plan ${i+1}/${cuts.length} — ${Math.round(frameCount/totalFrames*100)}%`;
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
+    }
+
+    document.getElementById('renderSub').textContent = 'Finalisation...';
+    await videoEncoder.flush();
+    muxer.finalize();
+
+    const blob = new Blob([target.buffer], { type: 'video/mp4' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'cutsync_trame.mp4'; a.click();
+
+    overlay.classList.remove('show');
+    showToast('Trame MP4 exportée !');
+
+  } catch(err) {
+    overlay.classList.remove('show');
+    console.error(err);
+    showToast('Erreur : ' + err.message);
+  }
+}
+
+
