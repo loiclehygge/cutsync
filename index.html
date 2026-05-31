@@ -2814,7 +2814,7 @@ function showToast(msg) {
 async function exportTemplateMP4() {
   if (cuts.length === 0) { showToast('Analyse une vidéo d\'abord'); return; }
   if (typeof VideoEncoder === 'undefined') { showToast('WebCodecs non supporté - utilise Chrome'); return; }
-  if (typeof Mp4Muxer === 'undefined') { showToast('mp4-muxer non chargé'); return; }
+  // mp4-muxer is inline - always available
 
   const overlay = document.getElementById('renderOverlay');
   overlay.classList.add('show');
@@ -2829,7 +2829,7 @@ async function exportTemplateMP4() {
   const totalFrames = Math.round(totalDuration * FPS);
 
   try {
-    const { Muxer, ArrayBufferTarget } = Mp4Muxer;
+    const { Muxer, ArrayBufferTarget } = Mp4Muxer; // Mp4Muxer is the namespace
     const target = new ArrayBufferTarget();
     const muxer = new Muxer({
       target,
