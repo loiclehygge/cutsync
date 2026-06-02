@@ -2691,92 +2691,94 @@ async function exportAssembled() {
   }
 }
 
-// ─── Export Trame MP4 via FFmpeg.wasm ────────────────────────────────────────
-let ffmpegLoaded = false;
-let ffmpegInstance = null;
-
-async function getFFmpeg() {
-  if (ffmpegLoaded) return ffmpegInstance;
-  const { FFmpeg } = FFmpegWASM;
-  const ff = new FFmpeg();
-  ff.on('progress', ({ progress }) => {
-    document.getElementById('renderBar').style.width = (progress * 100) + '%';
-  });
-  ff.on('log', ({ message }) => {
-    document.getElementById('renderSub').textContent = message.substring(0, 80);
-  });
-  await ff.load({
-    coreURL: '/ffmpeg/ffmpeg-core.js',
-    wasmURL: '/ffmpeg/ffmpeg-core.wasm',
-  });
-  ffmpegLoaded = true;
-  ffmpegInstance = ff;
-  return ff;
-}
-
+// ─── Export Trame MP4 via WebCodecs + mp4-muxer ─────────────────────────────
 async function exportTemplateMP4() {
   if (cuts.length === 0) { showToast('Analyse une vidéo d\'abord'); return; }
-  if (typeof FFmpegWASM === 'undefined') { showToast('FFmpeg non chargé'); return; }
+  if (typeof VideoEncoder === 'undefined') { showToast('WebCodecs non supporté - utilise Chrome'); return; }
 
   const overlay = document.getElementById('renderOverlay');
   overlay.classList.add('show');
   document.getElementById('renderTitle').textContent = 'Trame MP4';
-  document.getElementById('renderSub').textContent = 'Chargement FFmpeg (~30MB)...';
+  document.getElementById('renderSub').textContent = 'Initialisation...';
   document.getElementById('renderBar').style.width = '0%';
 
-  const W = 1080, H = 1920, FPS = 30;
+  const W = 1280, H = 720, FPS = 30;
   const colors = ['#FF4D6D','#00F0A0','#FFD166','#4DABF7','#FF9F43','#A29BFE','#FD79A8','#55EFC4','#FDCB6E','#74B9FF'];
+  const totalDuration = cuts.reduce((s, c) => s + c.duration, 0);
+  const totalFrames = Math.round(totalDuration * FPS);
 
   try {
-    const ff = await getFFmpeg();
+    const target = new Mp4Muxer.ArrayBufferTarget();
+    const muxer = new Mp4Muxer.Muxer({
+      target,
+      video: { codec: 'avc', width: W, height: H },
+      fastStart: 'in-memory'
+    });
 
-    const tmpCanvas = document.createElement('canvas');
-    tmpCanvas.width = W; tmpCanvas.height = H;
-    const ctx = tmpCanvas.getContext('2d');
+    const config = {
+      codec: 'avc1.42401E',
+      width: W, height: H,
+      bitrate: 2_000_000,
+      framerate: FPS,
+      avc: { format: 'annexb' }
+    };
 
-    let concatList = '';
+    const support = await VideoEncoder.isConfigSupported(config);
+    if (!support.supported) throw new Error('H264 non supporté sur cet appareil');
+
+    let encoderError = null;
+    const videoEncoder = new VideoEncoder({
+      output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+      error: (e) => { encoderError = e; console.error('VideoEncoder:', e); }
+    });
+    videoEncoder.configure(config);
+
+    const offCanvas = new OffscreenCanvas(W, H);
+    const ctx = offCanvas.getContext('2d');
+    let frameCount = 0;
 
     for (let i = 0; i < cuts.length; i++) {
-      document.getElementById('renderSub').textContent = `Plan ${i+1}/${cuts.length} - génération image...`;
-      document.getElementById('renderBar').style.width = (i / cuts.length * 50) + '%';
-
+      if (encoderError) throw encoderError;
+      const slotFrames = Math.round(cuts[i].duration * FPS);
       const color = colors[i % colors.length];
-      ctx.fillStyle = color; ctx.fillRect(0, 0, W, H);
-      ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(0, H/2-140, W, 280);
-      ctx.fillStyle = '#fff'; ctx.textAlign = 'center';
-      ctx.font = 'bold 200px Arial';
-      ctx.fillText('#' + String(i+1).padStart(2,'0'), W/2, H/2+70);
-      ctx.font = '70px Arial'; ctx.fillStyle = 'rgba(255,255,255,0.8)';
-      ctx.fillText(fmtTime(cuts[i].duration), W/2, H/2+170);
 
-      const blob = await new Promise(r => tmpCanvas.toBlob(r, 'image/png'));
-      const arr = new Uint8Array(await blob.arrayBuffer());
-      await ff.writeFile('slot' + i + '.png', arr);
+      ctx.fillStyle = color;
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.fillRect(0, H/2-80, W, 160);
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 120px Arial';
+      ctx.fillText('#' + String(i+1).padStart(2,'0'), W/2, H/2+40);
+      ctx.font = '40px Arial';
+      ctx.fillStyle = 'rgba(255,255,255,0.8)';
+      ctx.fillText(fmtTime(cuts[i].duration), W/2, H/2+90);
 
-      document.getElementById('renderSub').textContent = `Plan ${i+1}/${cuts.length} - encodage...`;
-      await ff.exec([
-        '-loop', '1', '-i', 'slot' + i + '.png',
-        '-t', cuts[i].duration.toFixed(3),
-        '-vf', 'fps=' + FPS,
-        '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-        '-y', 'seg' + i + '.mp4'
-      ]);
-
-      concatList += "file 'seg" + i + ".mp4'\n";
-      document.getElementById('renderBar').style.width = ((i+1) / cuts.length * 80) + '%';
+      for (let f = 0; f < slotFrames; f++) {
+        if (encoderError) throw encoderError;
+        const frame = new VideoFrame(offCanvas, {
+          timestamp: Math.round(frameCount * (1_000_000 / FPS)),
+          duration: Math.round(1_000_000 / FPS)
+        });
+        videoEncoder.encode(frame, { keyFrame: f === 0 });
+        frame.close();
+        frameCount++;
+        if (frameCount % 15 === 0) {
+          document.getElementById('renderBar').style.width = (frameCount/totalFrames*100) + '%';
+          document.getElementById('renderSub').textContent = `Plan ${i+1}/${cuts.length} — ${Math.round(frameCount/totalFrames*100)}%`;
+          await new Promise(r => setTimeout(r, 0));
+        }
+      }
     }
 
-    await ff.writeFile('concat.txt', concatList);
-    document.getElementById('renderSub').textContent = 'Assemblage final...';
-    await ff.exec(['-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', '-y', 'trame.mp4']);
-    document.getElementById('renderBar').style.width = '100%';
+    document.getElementById('renderSub').textContent = 'Finalisation...';
+    await videoEncoder.flush();
+    muxer.finalize();
 
-    const data = await ff.readFile('trame.mp4');
-    const mp4Blob = new Blob([data.buffer], { type: 'video/mp4' });
-    const url = URL.createObjectURL(mp4Blob);
+    const blob = new Blob([target.buffer], { type: 'video/mp4' });
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = 'cutsync_trame.mp4'; a.click();
-
     overlay.classList.remove('show');
     showToast('Trame MP4 exportée !');
 
